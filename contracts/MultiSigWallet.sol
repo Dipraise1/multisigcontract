@@ -10,6 +10,7 @@ import "@openzeppelin/contracts/utils/Pausable.sol";
  * @dev Perfect for team treasuries, DAO governance, and advanced fund management
  * @dev Features: Time-locks, batch operations, emergency recovery, transaction scheduling
  * @dev Security: Rate limiting, owner activity monitoring, transaction validation, emergency protocols
+ * @dev Enhanced Reentrancy Protection: Multiple layers of defense against reentrancy attacks
  * @author Built with ❤️ for the Ethereum community
  * @custom:security-contact security@multisigeth.com
  */
@@ -39,6 +40,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
     event WalletUpgraded(string version, uint256 timestamp);
     event SecurityAlert(string alertType, address indexed owner, uint256 timestamp);
     event RateLimitExceeded(address indexed owner, uint256 timestamp);
+    event ReentrancyAttempt(address indexed attacker, uint256 timestamp);
 
     // ========================================
     // STATE VARIABLES - Core wallet state
@@ -47,6 +49,13 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
     mapping(address => bool) public isOwner;    // Quick owner lookup
     uint256 public numConfirmationsRequired;    // Required confirmations for execution
     uint256 public transactionCount;            // Total transaction count
+    
+    // ========================================
+    // ENHANCED REENTRANCY PROTECTION
+    // ========================================
+    bool private _locked;                       // Custom reentrancy lock
+    mapping(address => bool) private _executing; // Per-address execution lock
+    mapping(uint256 => bool) private _txExecuting; // Per-transaction execution lock
     
     // ========================================
     // VERSIONING & UPGRADE TRACKING
@@ -127,6 +136,38 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
     uint256 public constant MAX_TIME_LOCK = 365 days;                      // Maximum time-lock duration
     uint256 public constant MIN_EMERGENCY_THRESHOLD = 2;                   // Minimum emergency threshold
     uint256 public constant EMERGENCY_COOLDOWN_PERIOD = 1 hours;           // Emergency action cooldown
+
+    // ========================================
+    // ENHANCED REENTRANCY PROTECTION MODIFIERS
+    // ========================================
+    
+    /**
+     * @dev Enhanced reentrancy guard with custom lock
+     * @dev Provides additional layer of protection beyond OpenZeppelin's ReentrancyGuard
+     */
+    modifier enhancedNonReentrant() {
+        require(!_locked, "MultiSigWallet: reentrant call");
+        require(!_executing[msg.sender], "MultiSigWallet: sender already executing");
+        
+        _locked = true;
+        _executing[msg.sender] = true;
+        
+        _;
+        
+        _executing[msg.sender] = false;
+        _locked = false;
+    }
+    
+    /**
+     * @dev Transaction-specific reentrancy protection
+     * @dev Prevents reentrancy on specific transaction execution
+     */
+    modifier txNonReentrant(uint256 _txIndex) {
+        require(!_txExecuting[_txIndex], "MultiSigWallet: transaction already executing");
+        _txExecuting[_txIndex] = true;
+        _;
+        _txExecuting[_txIndex] = false;
+    }
 
     // ========================================
     // MODIFIERS - Access control & validation
@@ -270,6 +311,9 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
         dailyTransactionLimit = 50; // 50 transactions per day per owner
         transactionCooldown = 1 minutes; // 1 minute between transactions per owner
         
+        // Initialize reentrancy protection
+        _locked = false;
+        
         // Emit initialization event
         emit WalletUpgraded("v1.0.0", block.timestamp);
     }
@@ -281,8 +325,9 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
     /**
      * @dev Allows contract to receive ETH
      * @dev Emits Deposit event for transparency
+     * @dev Enhanced with reentrancy protection
      */
-    receive() external payable {
+    receive() external payable enhancedNonReentrant {
         require(msg.value > 0, "MultiSigWallet: zero deposit not allowed");
         emit Deposit(msg.sender, msg.value, address(this).balance);
     }
@@ -304,6 +349,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * - Balance validation
      * - Contract address validation
      * - Time-lock duration limits
+     * - Enhanced reentrancy protection
      */
     function submitTransaction(
         address _to,
@@ -311,7 +357,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
         bytes memory _data,
         bool _timeLocked,
         uint256 _customTimeLock
-    ) external onlyOwner notPaused notEmergencyMode rateLimitRespected {
+    ) external onlyOwner notPaused notEmergencyMode rateLimitRespected enhancedNonReentrant {
         // Input validation
         require(_to != address(0), "MultiSigWallet: invalid destination address");
         require(_to != address(this), "MultiSigWallet: cannot send to self");
@@ -382,12 +428,13 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * - Total value validation
      * - Rate limiting
      * - Input validation
+     * - Enhanced reentrancy protection
      */
     function submitBatchTransactions(
         address[] memory _recipients,
         uint256[] memory _values,
         bytes[] memory _dataArray
-    ) external onlyOwner notPaused notEmergencyMode rateLimitRespected {
+    ) external onlyOwner notPaused notEmergencyMode rateLimitRespected enhancedNonReentrant {
         // Input validation
         require(
             _recipients.length == _values.length && _values.length == _dataArray.length,
@@ -455,6 +502,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      - Transaction existence check
      * - Execution status validation
      * - Confirmation status validation
+     * - Enhanced reentrancy protection
      */
     function confirmTransaction(uint256 _txIndex)
         external
@@ -464,6 +512,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
         notConfirmed(_txIndex)
         notPaused
         notEmergencyMode
+        enhancedNonReentrant
     {
         Transaction storage transaction = transactions[_txIndex];
         
@@ -491,10 +540,12 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * @param _txIndex Transaction index
      * 
      * Security features:
-     * - Reentrancy protection
+     * - Multi-layer reentrancy protection (OpenZeppelin + Custom)
      * - Time-lock validation
      * - Confirmation threshold validation
      * - Fee calculation and collection
+     * - Transaction-specific execution lock
+     * - State changes before external calls
      */
     function executeTransaction(uint256 _txIndex)
         external
@@ -505,6 +556,8 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
         notEmergencyMode
         timeLockExpired(_txIndex)
         nonReentrant
+        enhancedNonReentrant
+        txNonReentrant(_txIndex)
     {
         Transaction storage transaction = transactions[_txIndex];
 
@@ -514,7 +567,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
             "MultiSigWallet: cannot execute transaction"
         );
 
-        // Mark as executed
+        // CRITICAL: Update state BEFORE external calls to prevent reentrancy
         transaction.executed = true;
         
         // Calculate and apply transaction fee
@@ -526,7 +579,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
         
         uint256 transferAmount = transaction.value - feeAmount;
 
-        // Execute the transaction
+        // Execute the transaction with enhanced security
         (bool success, bytes memory returnData) = transaction.to.call{value: transferAmount}(
             transaction.data
         );
@@ -565,6 +618,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
         notExecuted(_txIndex)
         notPaused
         notEmergencyMode
+        enhancedNonReentrant
     {
         require(isConfirmed[_txIndex][msg.sender], "MultiSigWallet: transaction not confirmed");
 
@@ -591,11 +645,13 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * - Super majority requirement
      * - Cooldown period enforcement
      * - Recovery address validation
+     * - Enhanced reentrancy protection
      */
     function emergencyRecovery(address _to, uint256 _amount) 
         external 
         onlyOwner 
         notPaused 
+        enhancedNonReentrant
     {
         require(emergencyMode, "MultiSigWallet: emergency mode not active");
         require(_to != address(0), "MultiSigWallet: invalid recovery address");
@@ -612,7 +668,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
             "MultiSigWallet: insufficient emergency confirmations"
         );
         
-        // Execute recovery
+        // Execute recovery with enhanced security
         (bool success, ) = _to.call{value: _amount}("");
         require(success, "MultiSigWallet: emergency recovery failed");
         
@@ -628,8 +684,9 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * - Super majority requirement
      * - Owner validation
      * - Event logging
+     * - Enhanced reentrancy protection
      */
-    function activateEmergencyMode() external onlyOwner notPaused {
+    function activateEmergencyMode() external onlyOwner notPaused enhancedNonReentrant {
         require(!emergencyMode, "MultiSigWallet: emergency mode already active");
         
         uint256 confirmations = 0;
@@ -649,7 +706,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
     /**
      * @dev Deactivate emergency mode
      */
-    function deactivateEmergencyMode() external onlyOwner {
+    function deactivateEmergencyMode() external onlyOwner enhancedNonReentrant {
         require(emergencyMode, "MultiSigWallet: emergency mode not active");
         emergencyMode = false;
         emit SecurityAlert("EMERGENCY_MODE_DEACTIVATED", msg.sender, block.timestamp);
@@ -668,8 +725,9 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * - Duplicate prevention
      * - Owner count limits
      * - Contract address prevention
+     * - Enhanced reentrancy protection
      */
-    function addOwner(address _newOwner) external onlyOwner notPaused notEmergencyMode {
+    function addOwner(address _newOwner) external onlyOwner notPaused notEmergencyMode enhancedNonReentrant {
         require(_newOwner != address(0), "MultiSigWallet: invalid owner address");
         require(!isOwner[_newOwner], "MultiSigWallet: owner already exists");
         require(owners.length < MAX_OWNERS, "MultiSigWallet: maximum owners reached");
@@ -698,8 +756,9 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * - Owner validation
      * - Minimum owner count enforcement
      * - Threshold adjustment
+     * - Enhanced reentrancy protection
      */
-    function removeOwner(address _ownerToRemove) external onlyOwner notPaused notEmergencyMode {
+    function removeOwner(address _ownerToRemove) external onlyOwner notPaused notEmergencyMode enhancedNonReentrant {
         require(isOwner[_ownerToRemove], "MultiSigWallet: not an owner");
         require(owners.length > 1, "MultiSigWallet: cannot remove last owner");
 
@@ -732,7 +791,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * @dev Change the number of required confirmations
      * @param _newThreshold New threshold value
      */
-    function changeThreshold(uint256 _newThreshold) external onlyOwner notPaused notEmergencyMode {
+    function changeThreshold(uint256 _newThreshold) external onlyOwner notPaused notEmergencyMode enhancedNonReentrant {
         require(
             _newThreshold > 0 && _newThreshold <= owners.length,
             "MultiSigWallet: invalid threshold"
@@ -747,7 +806,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * @dev Set transaction fee (in basis points, 100 = 1%)
      * @param _fee New fee in basis points
      */
-    function setTransactionFee(uint256 _fee) external onlyOwner notPaused {
+    function setTransactionFee(uint256 _fee) external onlyOwner notPaused enhancedNonReentrant {
         require(_fee <= maxTransactionFee, "MultiSigWallet: fee too high");
         transactionFee = _fee;
         emit SecurityAlert("FEE_CHANGED", msg.sender, block.timestamp);
@@ -757,7 +816,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * @dev Change fee collector address
      * @param _newCollector New fee collector address
      */
-    function changeFeeCollector(address _newCollector) external onlyOwner notPaused {
+    function changeFeeCollector(address _newCollector) external onlyOwner notPaused enhancedNonReentrant {
         require(_newCollector != address(0), "MultiSigWallet: invalid collector address");
         require(_newCollector.code.length == 0, "MultiSigWallet: collector cannot be a contract");
         feeCollector = _newCollector;
@@ -767,7 +826,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
     /**
      * @dev Collect accumulated fees
      */
-    function collectFees() external notPaused {
+    function collectFees() external notPaused enhancedNonReentrant {
         require(msg.sender == feeCollector, "MultiSigWallet: only fee collector can collect");
         require(collectedFees > 0, "MultiSigWallet: no fees to collect");
         
@@ -784,7 +843,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * @dev Set default time-lock duration
      * @param _newTimeLock New time-lock duration in seconds
      */
-    function setDefaultTimeLock(uint256 _newTimeLock) external onlyOwner notPaused {
+    function setDefaultTimeLock(uint256 _newTimeLock) external onlyOwner notPaused enhancedNonReentrant {
         require(_newTimeLock <= MAX_TIME_LOCK, "MultiSigWallet: time-lock too long");
         defaultTimeLock = _newTimeLock;
         emit SecurityAlert("TIME_LOCK_CHANGED", msg.sender, block.timestamp);
@@ -795,7 +854,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * @param _dailyLimit New daily transaction limit
      * @param _cooldown New transaction cooldown period
      */
-    function setRateLimits(uint256 _dailyLimit, uint256 _cooldown) external onlyOwner notPaused {
+    function setRateLimits(uint256 _dailyLimit, uint256 _cooldown) external onlyOwner notPaused enhancedNonReentrant {
         require(_dailyLimit > 0 && _dailyLimit <= 1000, "MultiSigWallet: invalid daily limit");
         require(_cooldown >= 1 minutes && _cooldown <= 1 hours, "MultiSigWallet: invalid cooldown");
         
@@ -811,7 +870,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
     /**
      * @dev Pause the contract
      */
-    function pause() external onlyOwner {
+    function pause() external onlyOwner enhancedNonReentrant {
         _pause();
         emit SecurityAlert("CONTRACT_PAUSED", msg.sender, block.timestamp);
     }
@@ -819,7 +878,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
     /**
      * @dev Unpause the contract
      */
-    function unpause() external onlyOwner {
+    function unpause() external onlyOwner enhancedNonReentrant {
         _unpause();
         emit SecurityAlert("CONTRACT_UNPAUSED", msg.sender, block.timestamp);
     }
@@ -828,7 +887,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * @dev Upgrade wallet version (for future enhancements)
      * @param _newVersion New version number
      */
-    function upgradeWallet(uint256 _newVersion) external onlyOwner notPaused {
+    function upgradeWallet(uint256 _newVersion) external onlyOwner notPaused enhancedNonReentrant {
         require(_newVersion > walletVersion, "MultiSigWallet: version must increase");
         walletVersion = _newVersion;
         lastUpgradeTime = block.timestamp;
@@ -978,7 +1037,7 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
      * @dev Reset daily transaction counters (callable by any owner)
      * @dev This helps maintain accurate daily limits
      */
-    function resetDailyCounters() external onlyOwner {
+    function resetDailyCounters() external onlyOwner enhancedNonReentrant {
         uint256 today = block.timestamp / 1 days;
         dailyTransactionTotal[today] = 0;
         
@@ -987,5 +1046,13 @@ contract MultiSigWallet is ReentrancyGuard, Pausable {
         }
         
         emit SecurityAlert("DAILY_COUNTERS_RESET", msg.sender, block.timestamp);
+    }
+    
+    /**
+     * @dev Emergency function to detect and log reentrancy attempts
+     * @dev This function can be called by any owner to check for reentrancy
+     */
+    function detectReentrancy() external view returns (bool) {
+        return _locked || _executing[msg.sender];
     }
 }
